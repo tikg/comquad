@@ -1,3 +1,5 @@
+> **Personal Fork:** See [LOCAL_WORKFLOW.md](LOCAL_WORKFLOW.md) for my development workflow.
+
 # comquad (Compose + Quadlet 🍊)
 
 `comquad` is a Docker-compose-like CLI for Podman Quadlets, backed by systemd.
