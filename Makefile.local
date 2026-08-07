@@ -1,0 +1,14 @@
+readme-note:
+	@if grep -q "Personal Fork" README.md; then \
+		echo "Fork note already present"; \
+	else \
+		tmp=$$(mktemp); \
+		printf '%s\n\n' '> **Personal Fork:** See [LOCAL_WORKFLOW.md](LOCAL_WORKFLOW.md) for my development workflow.' > $$tmp; \
+		cat README.md >> $$tmp; \
+		mv $$tmp README.md; \
+		echo "Fork note added to README.md"; \
+	fi
+
+readme-clean:
+	@git restore README.md
+	@echo "README.md restored to committed state"
