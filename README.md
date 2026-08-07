@@ -1,4 +1,23 @@
 # comquad
+## Dev Notes / Fork Workflow
+
+```bash
+# Keep my fork in sync with the original project
+git fetch upstream
+git switch main
+git merge upstream/main
+git push origin main
+
+# Create a feature branch
+git switch -c feature/<feature-name>
+
+# Commit and push changes
+git add .
+git commit -m "Describe change"
+git push -u origin feature/<feature-name>
+```
+
+# comquad (Compose + Quadlet 🍊)
 
 `comquad` (Compose + Quadlet) is a Docker Compose-like CLI for Podman Quadlets and systemd.
 
