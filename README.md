@@ -1,23 +1,3 @@
-> **Personal Fork:** See [LOCAL_WORKFLOW.md](LOCAL_WORKFLOW.md) for my development workflow.
-
-## Dev Notes / Fork Workflow
-
-```bash
-# Keep my fork in sync with the original project
-git fetch upstream
-git switch main
-git merge upstream/main
-git push origin main
-
-# Create a feature branch
-git switch -c feature/<feature-name>
-
-# Commit and push changes
-git add .
-git commit -m "Describe change"
-git push -u origin feature/<feature-name>
-```
-
 # comquad (Compose + Quadlet 🍊)
 
 `comquad` is a Docker-compose-like CLI for Podman Quadlets, backed by systemd.
