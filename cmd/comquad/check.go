@@ -12,21 +12,22 @@ import (
 
 	"github.com/Inoriol/comquad/internal/deploy"
 	"github.com/Inoriol/comquad/internal/logger"
+	"github.com/Inoriol/comquad/internal/deps"
+
 )
 
 var checkCmd = &cobra.Command{
 	Use:   "check",
 	Short: "Check that required tools and services are available",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		tools := []string{"podman", "podlet"}
+	RunE: func(cmd *cobra.Command, args []string) error {	
 		var missing []string
 		var warnings []string
 
-		for _, tool := range tools {
-			if _, err := exec.LookPath(tool); err != nil {
-				missing = append(missing, tool)
-			}
+		if err := deps.EnsureRequirements(); err != nil {
+			return err
 		}
+
+		tools := []string{"podman", "podlet"}
 
 		if len(missing) > 0 {
 			return fmt.Errorf("missing required tools: %s", strings.Join(missing, ", "))
