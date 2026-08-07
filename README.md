@@ -1,5 +1,8 @@
 # comquad
-## Dev Notes / Fork Workflow
+> **Personal Fork:** See [LOCAL_WORKFLOW.md](LOCAL_WORKFLOW.md) for my development workflow.
+
+"Yessir!"
+# Dev Notes / Fork Workflow
 
 ```bash
 # Keep my fork in sync with the original project
