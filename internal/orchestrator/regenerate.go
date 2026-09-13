@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/Inoriol/comquad/internal/deploy"
 	"github.com/Inoriol/comquad/internal/logger"
@@ -33,7 +34,7 @@ func (o *Orchestrator) Regenerate(dryRun bool) error {
 			resources = &deploy.ResourceInfo{}
 		}
 
-		total := len(resources.Containers) + len(resources.Networks) + len(resources.Volumes)
+		total := len(resources.Containers) + len(resources.Networks) + len(resources.Volumes) + len(resources.Images) + len(resources.Builds)
 		logger.Printf("  %s (%d resource%s)\n", p.ProjectName, total, pluralize(total))
 
 		for _, c := range resources.Containers {
@@ -61,6 +62,14 @@ func (o *Orchestrator) Regenerate(dryRun bool) error {
 
 	if err := stateMgr.Save(); err != nil {
 		return fmt.Errorf("failed to save state file: %w", err)
+	}
+
+	// Baseline integrity is unknown after a rebuild, so clear it to force a
+	// clean 2-way reconcile on the next `up`.
+	for _, p := range projects {
+		if dir, err := resolveBaselineDir(p.ProjectName); err == nil {
+			os.RemoveAll(dir)
+		}
 	}
 
 	logger.Printf("Regenerated state file: %s\n", stateMgr.StateFilePath)

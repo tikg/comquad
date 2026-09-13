@@ -1,456 +1,170 @@
-# Architecture & Technical Design
+# Architecture
 
-This document details the internal design, component mapping, and execution lifecycle of **comquad**. Read this to understand how your Docker Compose components translate safely into native systemd Quadlets.
+comquad turns a Compose project into systemd-managed Podman services. It does not supervise containers itself. It generates Quadlet files, asks systemd to reload them, and uses systemd and Podman for the runtime operations.
 
-## 🔄 Execution Lifecycle
+## System Overview
 
-When you run `comquad up`, the engine moves your configuration through a five-step pipeline:
+```mermaid
+flowchart LR
+    A[compose.yaml] --> B[Compose parser]
+    B --> C[compose2quadlet]
+    C --> D[Generated Quadlet units]
+    D --> E[Reconcile and diff]
+    E --> F[systemd Quadlet]
+    F --> G[Podman resources]
+    E --> H[Project state and baseline]
+```
 
-1. **Preprocess** — Normalizes your `compose` yaml (resolves relative to absolute paths, sets default networks, injects project labels). `build:` blocks are explicitly rejected with an error — build support is not yet implemented.
-2. **Transpile** — Executes the `podlet` binary under the hood to convert the compose YAML configuration into `.container`, `.network`, `.volume`, `.image`, and `.build` quadlet files.
-3. **Cook** — Post-processes the raw quadlet outputs. This stage prefixes files with `cq-<project>`, rewrites cross-unit references so services can communicate, injects `NetworkAlias=` for DNS resolution, injects `com.comquad.managed` and `com.comquad.project` labels on all files, and applies rootless port offsets where needed. Returns a `CookResult` containing the in-memory content of all written files (keyed by destination path) to avoid redundant disk I/O in subsequent steps.
-4. **Graft** — Post-processes quadlet file contents to handle compose fields that podlet does not support or supports with known flaws. Currently a no-op stub; future handlers in `graft/handlers/` will plug gaps (e.g. intercepting `build:` blocks once they are supported).
-5. **Deploy** — Pulls images based on the configured pull strategy, then relocates the finalized files to the systemd configuration directory, registers the metadata in the centralized state file, and triggers the unit starts via D-Bus. If `startUnits` fails, the cleanup function removes all files, unregisters the project, and reloads the daemon to prevent a half-deployed state.
+The main path is:
 
-### Dry Run Mode (`--dry-run`)
+1. Read and validate `compose.yaml`.
+2. Convert Compose objects into Quadlet units.
+3. Compare the generated units with the deployed project.
+4. Show a diff and ask for confirmation when changes are found.
+5. Write the units, reload systemd, and start or restart affected resources.
+6. Record the deployment state and generated baseline.
 
-When `comquad up --dry-run` is used, the pipeline runs steps 1–3 into a private temporary directory instead of the real systemd target. After cooking, `printDryRun` reads each generated file and prints:
-
-- The **target path** it *would* be written to
-- The full **file content** of each quadlet
-- **Image pull actions** that *would* be taken per container, based on the pull strategy and whether images exist locally
-
-Steps 4–5 are skipped entirely: no graft processing, no files are written to the systemd directory, no state is registered, and no units are started. The temporary preview directory is cleaned up automatically.
-
-## 📦 Project Directory Structure
-
-The codebase is organized cleanly into domains matching the execution lifecycle steps:
+## Repository Structure
 
 ```text
-cmd/comquad/           # CLI entry point: main.go + per-command files (up.go, down.go, logs.go, …)
-internal/graft/          # Post-processing engine for compose fields podlet doesn't handle
-                       #   (currently no-op; handlers/ will plug future gaps)
-internal/cooker/       # Post-processes quadlet files: engine.go (core), references.go (rewriting),
-                       #   ports.go (offsetting), labels.go (SELinux/aliases/systemd opts)
-internal/deploy/       # Systemd D-Bus communication, target directories, state tracking,
-                       # and the SystemdClient / StateStore interfaces used for testing
-internal/logger/       # Colorized logging with quiet/verbose tiers
-internal/orchestrator/ # The engine wiring all packages: orchestrator.go (core/Up), down.go,
-                       #   images.go (build/pull/printDryRun), pipeline.go (helpers), plus
-                       #   per-command files (lifecycle, logs, exec, view, edit, etc.)
-internal/preprocess/   # Pre-parser to normalize raw compose.yaml files
-internal/transpile/    # Wrapper executing the podlet binary
-
+cmd/comquad/           CLI commands and entry point
+compose2quadlet/       Compose-to-Quadlet conversion library
+internal/orchestrator/ Deployment pipeline and command behavior
+internal/reconcile/    Diffing, merging, and atomic application
+internal/deploy/       systemd D-Bus, Podman, paths, and project state
+internal/logger/       Output levels and color handling
+tests/integration/     End-to-end tests using Podman and systemd
 ```
 
-## 📊 Ps Command
+The orchestrator coordinates the other packages. The conversion library produces units; the reconcile package decides what should change; the deploy package applies those changes through systemd and Podman.
 
-The `ps` command shows container runtime status in `docker compose ps` style. It queries Podman for container data and merges it with systemd D-Bus unit state.
+## `up` Lifecycle
 
-**Data sources:**
+`comquad up` is the primary operation. Its pipeline has four stages:
 
-1. **Podman** — Runs `podman ps --filter "label=com.comquad.managed=true" --filter "label=com.comquad.project=<name>" --format json` (or `-a` flag for exited containers). Parses JSON to extract container name, image, command, state, status, ports, networks, mounts, exit code, and timestamps. Runs `podman inspect <container>` for each container to extract `Config.ExposedPorts`.
-2. **D-Bus** — Queries `ListUnitsByNames()` targeting only the project's container units. Merges `ActiveState` and `SubState` into each container record.
+### 1. Read and Transpile
 
-**Output format:**
+`compose2quadlet.TranspileFile()` loads the Compose file through compose-go/v2 and produces structured Quadlet units. It handles services, networks, volumes, secrets, images, and build blocks, then serializes them as Quadlet INI files.
 
-```
-NAME                 IMAGE                          COMMAND                   SERVICE      CREATED              STATUS               PORTS
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-my_nginx             docker.io/library/nginx:alpine nginx -g daemon off;      nginx        2 minutes ago        Up 2 minutes         0.0.0.0:2080->80/tcp
-2nginx               docker.io/library/nginx:alpine nginx -g daemon off;      nginx2       2 minutes ago        Up 2 minutes         0.0.0.0:2081->80/tcp
-```
+The conversion also applies comquad-specific behavior, including:
 
-Columns are auto-width based on content. Exited containers show `Exited (<code>) <time>` in the status column. Dead containers show `Dead`. Ports are formatted as `host_ip:host_port->container_port/protocol` for published ports, and `port/protocol` for exposed ports (container-only, no host binding). Exposed ports are listed first, followed by published ports. Created time uses relative format (`just now`, `5m ago`, `2d ago`, or `Jan 02 2006` for older entries).
+- Project-prefixed resource names and references
+- Container names and service network aliases
+- A default network when a service has no explicit network
+- Absolute paths for relative bind mounts
+- SELinux mount relabeling when applicable
+- Rootless port offsets
+- Image and build unit generation
+- comquad management and project labels
 
-Containers are sorted: running first (by name), then exited (by name), then other states (by name). This ensures `ps -a` groups exited containers together at the bottom of the table.
+The conversion library is documented separately in [compose2quadlet/ARCHITECTURE.md](./compose2quadlet/ARCHITECTURE.md) and [compose2quadlet/doc/mapping.md](./compose2quadlet/doc/mapping.md).
 
-**Flags:**
+### 2. Compute a Change Plan
 
-* `-a, --all` — Include exited/dead containers (uses `podman ps -a`)
+`internal/reconcile` compares the new generated units with the files currently deployed. The result is a read-only plan containing per-file changes, removals, and merge conflicts.
 
-**Testability:** `Orchestrator.listContainers` is an injectable function field (`func(projectName string, all bool) ([]ContainerInfo, error)`), allowing tests to provide canned container data without a live Podman daemon.
+On an existing deployment, comquad uses three inputs:
 
-## 👁️ View Command
+- **Baseline:** the units generated by the previous successful `up`
+- **Disk:** the files currently in the systemd Quadlet directory
+- **New:** the units generated from the current `compose.yaml`
 
-The `view` command provides two modes of inspection:
-
-**Project view** (no service argument): queries systemd D-Bus for all units belonging to a project, computes aggregate health status, and displays a table of `UNIT`, `ACTIVE`, and `SUB` states. Status is `healthy` when all units are active, `down` when none are active, and `degraded` when only some are active.
-
-**Unit file view** (with service argument): resolves the quadlet file using five matching patterns (`web` → `cq-myapp-web.container`, `cq-myapp-web`, `cq-myapp-web.service`, `cq-myapp-web.container`, or `myapp-web`), reads the file, and prints its contents prefixed with a `── <filename> ──` header.
-
-Unit resolution iterates over `state.Files` from `projects.json`, checking each pattern in order until a match is found.
-
-## ✏️ Edit Command
-
-The `edit` command provides two modes of file editing:
-
-**Project edit** (no service argument): resolves all `.container`, `.network`, `.volume`, `.image`, and `.build` quadlet files for a project and opens them in `$EDITOR` (falls back to `findDefaultEditor()` which probes `editor`, `nano`, `vim`, then `vi`). `$EDITOR` is split on whitespace, so values like `"vim -o"` or `"code --wait"` work correctly. After the editor exits, comquad compares file contents and auto-reloads systemd, restarting any changed container units.
-
-**Unit file edit** (with service argument): resolves a single quadlet file using the same matching patterns as `view`, opens it in the editor, and reloads systemd if changes were detected.
-
-The `--no-reload` flag opens files without triggering a systemd daemon reload or unit restart.
-
-Unit resolution shares the same matching logic as `view`, using `MatchFirstContainer` and `MatchQuadletResource` helpers that iterate over `state.Files` from `projects.json`.
-
-## 📋 Logs Command
-
-The `logs` command queries systemd D-Bus to determine each unit's state and filters output accordingly:
-
-**Running units** (`ActiveState == "active"`): retrieves the `InvocationID` property via D-Bus `GetUnitProperties` and passes it to `journalctl --invocation=<hex>`, showing only logs from the current invocation.
-
-**Stopped / failed units**: no filter is applied, showing full historical logs.
-
-Service name matching uses the same multi-pattern logic as `view` and `edit`: exact file name, name without extension, name with `.service` suffix, short name (after stripping `cq-<project>-` prefix), internal Podman name (after stripping `cq-` prefix), or `ContainerName=` directive from the unit file. `MatchAllContainers` returns all matching files per argument, allowing a single arg like `web` to match multiple services.
-
-### Flags
-
-- `--tail <N>` — Limit output to the last N lines
-- `--since <time>` — Show logs since a specific time (e.g. `10m`, `2024-01-01 12:00:00`)
-- `-t, --time` — Display timestamps in RFC3339Nano format (docker compose compatible)
-
-Logs from multiple units are collected via `journalctl --output=json`, parsed, sorted by `__REALTIME_TIMESTAMP`, and rendered in chronological order. Each line is prefixed with `[<unit-name>]` to identify its source.
-
-## 🔄 Lifecycle Commands (Start, Stop, Restart)
-
-The `start`, `stop`, and `restart` commands manage the runtime state of deployed projects without touching quadlet files or triggering daemon-reload. They operate directly via D-Bus.
-
-**Service resolution:** All three commands accept optional `[service ...]` positional arguments. When provided, they use `MatchAllContainers` to resolve service names to unit names. When omitted, all `.container`, `.image`, and `.build` files from the project's state are started/stopped/restarted.
-
-**Start** — Iterates over resolved unit names and calls `StartUnit` via D-Bus. Reports per-unit status messages.
-
-**Stop** — Iterates over resolved unit names and calls `StopUnit` via D-Bus, then verifies all units are no longer active (same verification as `down`).
-
-**Restart** — Iterates over resolved unit names and calls `RestartUnit` via D-Bus, which tears down and recreates the unit cleanly.
-
-All three commands require the project to exist in `projects.json` state. They share a `resolveUnits()` helper that looks up the project state, matches service names, and deduplicates results.
-
-**Flags:** All three commands accept `--dry-run` to preview which units would be affected without making changes.
-
-## 🗑️ Down Command
-
-The `down` command performs a complete teardown of a deployed project in six steps:
-
-1. **Stop units** — Stops all container, image, and build units via systemd D-Bus `StopUnit`, then verifies all units are no longer active. Network and volume units are also stopped.
-2. **Remove quadlet files** — Deletes all `.container`, `.network`, `.volume`, `.image`, and `.build` files from the systemd target directory.
-3. **Reload daemon** — Triggers `daemon-reload` via D-Bus so systemd forgets the removed units and releases its references to networks and volumes.
-4. **Remove networks** — Lists all Podman networks with label `com.comquad.managed=true` and project label matching the current project, then removes them via `podman network rm`.
-5. **Remove volumes (opt-in)** — When the `-d, --delete-volumes` flag is provided, lists all Podman volumes with label `com.comquad.managed=true` and project label matching the current project, then removes them via `podman volume rm`. Volumes are opt-in because they may contain persistent data.
-6. **Unregister project** — Removes the project entry from `projects.json` state file.
-
-**Usage:**
-
-```bash
-comquad down          # stops containers, removes networks, removes quadlet files
-comquad down -d       # also removes Podman volumes
-comquad down -y       # skip confirmation prompt
-comquad down --dry-run # preview what would be removed without making changes
-```
-
-The `down` command prompts for confirmation when stdin is a terminal. This prevents accidental teardown. Confirmation is skipped when `--dry-run`, `--yes`/`-y`, or when stdin is not a terminal (piped/non-interactive).
-
-**Flags:**
-* `-d, --delete-volumes` — Also remove Podman volumes
-* `-y, --yes` — Skip confirmation prompt
-* `--dry-run` — Show what would be removed without actually removing anything
-
-## 🐳 Exec Command
-
-The `exec` command runs a command inside a running container via `podman exec`. It requires a single service argument and allocates a TTY by default (like `docker compose exec`).
-
-**Service resolution:** Uses `MatchAllContainers` to resolve the service name to a container quadlet file. The container name is derived from the base filename by stripping the `cq-` prefix and `.container` suffix (e.g. `cq-myapp-web.container` → `myapp-web`). If the service matches multiple containers, an error is returned listing the ambiguous matches.
-
-**Flags:** `-u/--user` sets the user inside the container, `-t/--tty` controls TTY allocation (default `true`). The command is passed directly to `podman exec`, which handles `--` flag separation.
-
-## 🔄 Regenerate Command
-
-The `regenerate` command restores the state file by scanning Podman for managed resources. It is the foundation of comquad's self-healing state management.
-
-**Discovery pipeline:**
-
-1. Queries Podman for all containers with label `com.comquad.managed=true`
-2. Queries Podman for all networks with label `com.comquad.managed=true`
-3. Queries Podman for all volumes with label `com.comquad.managed=true`
-4. Groups all resources by their `com.comquad.project` label value
-5. Resolves quadlet files in the systemd target directory matching `cq-<project>-*.container`, `*.network`, `*.volume`, `*.image`, `*.build`
-6. Writes the reconstructed state to `projects.json`
-
-**Flags:**
-
-* `--force` — Required to overwrite existing state (safety guard)
-* `--dry-run` — Preview what would be regenerated without writing the state file. Can be combined with `--force` to safely inspect what `regenerate` would do.
-
-**Usage:**
-
-```bash
-comquad regenerate --force              # regenerate state from Podman labels
-comquad regenerate --force --dry-run    # preview without writing
-```
-
-## 💾 State & File System Management
-
-### State File Location
-
-`comquad` keeps track of active, managed projects in a light JSON database.
-
-* **Default:** `~/.local/share/comquad/projects.json`
-* **Overridden by:** `$XDG_DATA_HOME/comquad/projects.json`
-
-### State File Format
-
-Each project entry contains:
-
-```json
-{
-  "project_name": "myproject",
-  "source_path": "/home/user/projects/myproject",
-  "files": ["/path/to/cq-myproject-web.container"],
-  "resources": {
-    "containers": ["cq-myproject-web"],
-    "networks": ["cq-myproject-default-network"],
-    "volumes": []
-  }
-}
-```
-
-* **project_name** — The Comquad project name
-* **source_path** — Path to the compose file directory (empty when restored via `regenerate`)
-* **files** — List of quadlet file paths in the systemd target directory
-* **resources** — Podman resources discovered via labels (`containers`, `networks`, `volumes`). Populated by `regenerate`. When `up` re-registers an existing project, any previously stored resource info is preserved.
-
-The state file is written atomically: comquad writes to a `.tmp` file in the same directory and renames it, so a crash mid-write never produces a corrupt state file.
-
-### Target Systemd Directories
-
-Quadlet configurations are copied into paths dictated by your execution context:
-
-* **Rootless Mode (Default user):** `~/.config/containers/systemd`
-* **Root Mode (UID 0 / sudo):** `/etc/containers/systemd`
-
----
-
-## 📋 Compose Format Implementation Details
-
-`comquad` accepts standard Docker Compose v3 files supporting `services`, `networks`, and `volumes`.
-
-The following fields accept both map (`KEY: value`) and list (`- KEY=value`) formats when passed to podlet:
-
-* `environment` — service environment variables
-* `labels` — service, network, and volume labels
-
-The following compose service fields are **explicitly processed** by comquad's preprocessor:
-
-* `build` — explicitly rejected with an error; build support is not yet implemented
-* `container_name` — auto-generated if missing (`<project>-<service>`)
-* `image` — normalized to full registry path (`docker.io/library/`)
-* `volumes` — bind mount host paths with `./` or `../` prefixes are resolved to absolute paths
-* `networks` — auto-attached to `cq-default` when a default bridge network is injected
-
-All other compose fields (`entrypoint`, `command`, `expose`, `deploy`, `environment`, `depends_on`, `restart`, `working_dir`, `user`, `healthcheck`, `cap_add`/`cap_drop`, `tmpfs`, `read_only`, `extra_hosts`, `dns`, `hostname`, `privileged`, `mem_limit`, `cpus`, `volumes_from`, `links`, `tty`, `stdin_open`, `security_opt`, `shm_size`, `labels`, and `x-` extensions) are **passed through unchanged** to `podlet` via a schema-less YAML model.
-
-### Automatic Behaviors & Opinionated Transforms
-
-To ensure the transition to Quadlets is frictionless, the internal engine enforces several rules:
-
-* Relative volume host paths are automatically fully-qualified to absolute paths.
-* When SELinux is detected (via `/sys/fs/selinux/enforce`), all `Volume=` directives in generated `.container` files get `,z` appended to mount options (`:ro` → `:ro,z`, `:rw` → `:rw,z`, no option → `:z`). Idempotent — skips if `:z` or `:Z` already present.
-* A default bridge network (`cq-default`) is implicitly injected only when the compose file defines no networks at all. Services without an explicit `networks:` key are auto-attached to `cq-default` only when that network was injected — preventing dangling network references when user-defined networks exist.
-* Generated containers follow a strict naming blueprint: `<project>-<service>`.
-* `NetworkAlias=` is injected into every `.container` file so services can resolve each other by service name and `ContainerName=` value within compose networks.
-* An identifying label (`com.comquad.project`) is attached to all generated units.
-* A `com.comquad.managed` label is attached to all files to indicate comquad management.
-* Unprefixed public images default seamlessly to standard Docker Hub (`docker.io/library/`).
-* In rootless mode, privileged ports (< 1024) are automatically offset by `ROOTLESS_PORT_OFFSET` (default 2000). Internal port conflicts within a project are resolved by incrementing.
-
-### Build: Blocks
-
-`build:` blocks are currently **rejected** by the preprocessor. Attempting to deploy a compose file containing a `build:` block will produce an error. Build support is planned for a future release and will be implemented via graft handlers in `internal/graft/handlers/`.
-
-### Quadlet Feature Injections
-
-You can inject native Quadlet behaviors via labels. For example, to prevent auto-updates on a specific container image, set `comquad-no-autoupdate`:
-
-```yaml
-services:
-  web:
-    image: nginx
-    labels:
-      comquad-no-autoupdate: "true"
-    # labels:                        # Also supported (list format):
-    #   - comquad-no-autoupdate=true
-```
-
-## 🧪 Testing Architecture
-
-The orchestrator package was historically untestable because it constructed `SystemdManager` and `StateManager` directly inside every method. Two interfaces in `internal/deploy/interfaces.go` solve this:
-
-- **`SystemdClient`** — all nine D-Bus methods used by the orchestrator (`StartUnit`, `StopUnit`, `RestartUnit`, `ReloadDaemon`, `WaitForUnit`, `ListUnitsByNames`, `ListAllUnits`, `GetInvocationID`, `Close`). The concrete `SystemdManager` satisfies this interface.
-- **`StateStore`** — all state operations used by the orchestrator (`GetProject`, `GetStateFilePath`, `ListProjects`, `RegisterProject`, `UnregisterProject`, `Save`). The concrete `StateManager` satisfies this interface. `GetProject` replaces direct `Projects[name]` map access, making the interface satisfiable without exposing the map.
-
-`Orchestrator` holds four factory fields instead of calling the constructors directly:
-
-```go
-newState       func() (deploy.StateStore, error)
-newSystemd     func() (deploy.SystemdClient, error)
-listContainers func(projectName string, all bool) ([]ContainerInfo, error)
-newJournalCmd  func(name string, args ...string) *exec.Cmd
-```
-
-`NewOrchestrator` wires in the real implementations. Tests override these fields with in-memory fakes (`mockStateStore`, `mockSystemdClient`) that record calls and return canned responses, enabling full unit-test coverage without a live D-Bus or Podman daemon.
-
-### Project Deployment Helper
-
-The `ensureProjectDeployed()` helper encapsulates the common pattern of creating a state manager, fetching the project, and failing if it does not exist. It returns `(StateStore, ProjectState, error)` to support both state access and operations like `UnregisterProject`. Eight methods use this helper: `Ps`, `Down`, `View`, `Edit`, `Exec`, `Logs`, `FollowLogs`, and `resolveUnits`.
-
-### Image Normalization
-
-The `normalizeImage()` function in `internal/preprocess/` ensures images have full registry paths. It distinguishes registry hostnames (containing `.` or `:port` where port is all digits) from image names with tags (e.g., `myapp:v1`). The `isRegistryWithPort()` helper checks if `:` is followed by only digits to avoid false positives with tagged image names.
-
-The `transpile` package is tested via a fake `podlet` shell script placed on a temp PATH entry, exercising the stdin pipe, argument passing, and error paths without requiring the real binary.
-
-### CI Pipeline & Build
-
-Automated testing runs via `.github/workflows/test.yml` on every push and PR to `main`:
-
-- **Build & vet** — `go build ./...` and `go vet ./...`
-- **Short tests** — `go test -short` (skips tests requiring external binaries)
-- **Race detector** — `go test -race` on all packages
-- **Coverage** — `go test -cover` with per-package and total coverage report
-
-Makefile targets (`make test-unit`, `make test-race`, `make test-cover`, `make test-short`) provide
-the same commands locally. Coverage currently sits at ~60% overall, with `cooker` (89%), `transpile`
-(85%), and `preprocess` (82%) leading the way.
-
-The `captureStdout` helper in `internal/orchestrator/dryrun_test.go` uses a `sync.Mutex` to serialize
-`os.Stdout` redirection, making it safe to use alongside `t.Parallel()` — only the capture window
-serializes, not the entire test.
-
-## 📋 Follow Logs on Deploy
-
-When `comquad up -f` is used, after successfully deploying all units the CLI captures the current timestamp and streams all journal logs for every project unit (containers, networks, volumes, images, and builds) from that point onward. This emulates the default `docker compose up` behavior (without `-d`), keeping the terminal attached to live output until interrupted with Ctrl+C.
-
-The deployment timestamp is captured after image handling completes but before `daemon-reload` and unit starts, ensuring no startup logs are missed.
-
-The follow mode uses JSON output with a buffered flush (500ms interval) to maintain chronological order and supports the `-n/--tail` and `-t/--time` flags via the `FollowLogs()` function.
-
-## 📊 Output Levels
-
-comquad has three output modes, controlled by flags on the root command:
-
-| Mode | Flag | What's shown |
-|---|---|---|
-| Normal (default) | *(none)* | Operational messages: pipeline stage progress, unit starts/stops, deploy success, errors |
-| Verbose | `-v` / `--verbose` | All of the above plus every pipeline transformation |
-| Quiet | `-q` / `--quiet` | Errors only (stderr). All other output is suppressed. Useful in scripts. |
-
-The `Up` pipeline now prints progress indicators at each stage via `logger.Action()`:
-- "Reading compose file..."
-- "Preprocessing compose configuration..."
-- "Transpiling to quadlet files..."
-- "Generating quadlet files..."
-- "Handling images..."
-- "Starting services..."
-
-These appear in normal mode (blue), distinct from verbose-only `logger.Info()` output.
-
-`--quiet` takes precedence over `--verbose`. `logger.Error(...)` always writes to stderr regardless of either flag.
-
-The logger lives in `internal/logger/` and exposes four tiers:
-- **`logger.Print(msg)`** — normal operational output, suppressed by `--quiet`
-- **`logger.Action/Success/Warn(msg)`** — user-facing actions and confirmations (blue/green/yellow), shown by default, suppressed by `--quiet`
-- **`logger.Info(msg)`** — verbose-only pipeline internals, requires `-v`
-- **`logger.Error(msg)`** — always to stderr, never suppressed
-
-Colors use ANSI codes (green=success, cyan=info, yellow=warning, red=error, blue=action) and are disabled when `NO_COLOR` is set.
-
-When `-v` / `--verbose` is enabled, comquad additionally logs every transformation applied during the deployment pipeline:
-
-**Preprocess stage** logs:
-- `Injected container_name: <name>` — when a container name was auto-generated
-- `Normalized image: <original> → <normalized>` — image name normalization to full registry path
-- `Normalized volume path: <relative> → <absolute>` — relative volume path resolution
-- `Created default network: cq-default` — when a default bridge network was injected
-- `Auto-attached '<service>' to network 'cq-default'` — services auto-attached to default network
-
-**Cook stage** logs:
-- `Renamed <old> → <new>` — file renaming with `cq-<project>-` prefix
-- `Rewrote cross-unit references in <file>` — reference rewriting for Network=/Volume=/Pod= and [Unit] section (After=, Requires=, etc.) directives
-- `Added AutoUpdate=registry to <file>` — systemd auto-update optimization
-- `Added [Install] section to <file>` — systemd install section injection
-- `Added NetworkAlias=<name> to <file>` — DNS resolution for compose networks
-- `Added labels: Label=com.comquad.project=<name>, Label=com.comquad.managed=true` — label injection
-- `Offset port: PublishPort=<original> → PublishPort=<offset>` — rootless port offsetting
-
-**Deploy stage** logs:
-- `Removing network: <name>` — network removal
-- `Removing volume: <name>` — volume removal
-
-Network and volume removal errors are always printed to stderr regardless of verbose mode, so cleanup failures are never silently dropped.
-
-**Error output:** `logger.Error(...)` always writes to stderr regardless of the verbose setting. Only internal pipeline details (`logger.Info`) are gated behind `-v`.
-
-## 🧪 Integration Testing
-
-Integration tests verify the full end-to-end lifecycle of comquad against a real
-systemd instance, real Podman daemon, and real podlet binary. They complement the
-unit tests (which mock D-Bus and state via interfaces) by exercising the complete
-pipeline from `compose` → quadlet files → running containers.
-
-### Test Environment
-
-Tests run inside a privileged Podman container with systemd as PID 1. This gives
-each test run a fully isolated, reproducible environment with a real D-Bus session,
-real cgroup hierarchy, and real systemd unit activation — without touching the host.
-
-The test image is defined in `tests/integration/Containerfile` and baked ahead of
-time (never installed at test runtime) with all required dependencies:
-
-- `golang` — to compile and run integration test binaries
-- `podman` — container runtime
-- `systemd` — PID 1, D-Bus, unit management
-- `podlet` — quadlet transpiler (Fedora package)
-- `sudo`, `shadow-utils`, `slirp4netns`, `fuse-overlayfs` — rootless support
-
-The `comquad` binary is pre-built on the host (`make build`) and mounted read-only
-into the container via the workspace volume, so the container never rebuilds it.
-
-A non-root user (`testuser`) is pre-created with `/etc/subuid` and `/etc/subgid`
-entries. Linger is enabled by writing `/var/lib/systemd/linger/testuser` directly
-(no runtime `loginctl` call needed), so the systemd user instance starts correctly
-for rootless test scenarios.
-
-### Test Structure
+This allows comquad to distinguish Compose changes from manual edits made with `comquad edit`:
 
 ```text
-tests/
-  integration/
-    helpers/
-      binary.go        # Invoke comquad binary, capture stdout/stderr/exit code
-      compose.go       # Write temp compose files, reusable compose templates
-      podman.go        # Inspect Podman containers, networks, volumes
-      selinux.go       # SELinux detection helpers for conditional test skipping
-      state.go         # Read and assert projects.json state file contents
-      systemd.go       # Poll and assert systemd unit states via systemctl
-    testdata/          # Static compose files and Dockerfiles for complex scenarios
-    up_down_test.go    # Core up/down lifecycle, idempotency, volume retention
-    dry_run_test.go    # Dry-run isolation: no files written, no state registered
-    lifecycle_test.go  # start/stop/restart command flows
-    logs_test.go       # Log retrieval for running and stopped units
-    exec_test.go       # podman exec command tests
-    exec_ambiguous_test.go # Ambiguous service matching validation
-    rootless_test.go   # Rootless mode: port offsetting, target directory, user instance
-    selinux_test.go    # SELinux :z label injection (quadlet files and runtime mounts)
-    view_edit_test.go  # view/edit command tests
+baseline + manual edits + new Compose output
+                  |
+                  v
+             merged units
 ```
 
-### Test Design Decisions
+Conflicting edits are reported and the manual value wins. On a first deployment, or after `regenerate`, no baseline is available, so comquad falls back to a two-way comparison and warns that manual changes cannot be identified.
 
-All tests use `--name <project>` with `comquad up` to explicitly specify the project name,
-decoupling test behavior from the directory name. The `WriteCompose` helper returns the
-project name parsed from the compose `name:` field, ensuring tests always use the correct
-name for both `up` and `down` calls. This prevents fragile dependencies on `t.TempDir()`
-naming conventions.
+### 3. Show and Apply Changes
 
-SELinux tests use `helpers.SELinuxPresent(t)` for skip conditions to detect SELinux
-mount availability, not enforcement mode, since comquad's `:z` injection triggers on
-presence detection via `/sys/fs/selinux/enforce` file content.
+Unless `--no-diff` is used, `up` displays the plan before applying it. New files are shown in full, changed files as unified diffs, and removed files as removal diffs.
+
+`--dry-run` computes and displays the plan without writing files, updating state, pulling images, reloading systemd, or starting units.
+
+Applying a plan:
+
+1. Writes generated Quadlet files atomically.
+2. Removes files for services no longer in the Compose file.
+3. Updates the baseline.
+4. Reloads the systemd manager.
+5. Starts new resources and restarts changed containers and images.
+6. Registers the project in the state file.
+
+Only affected units are restarted. If a later step fails, files and baselines touched by the deployment are restored where possible.
+
+### 4. Follow Logs
+
+`comquad up -f` performs the deployment first, then follows journal output for the project units. The log start time is captured before units are started so startup logs are included.
+
+## Reconciliation and State
+
+comquad keeps two kinds of local state:
+
+- `projects.json` records deployed projects, source paths, generated files, and managed resources.
+- `baseline/<project>/` stores the pure generated output from the last successful deployment.
+
+The baseline is deliberately separate from the files on disk. This is what makes it possible to preserve manual changes while still applying changes from `compose.yaml`.
+
+State is stored below `$XDG_DATA_HOME/comquad/`, defaulting to `~/.local/share/comquad/`. The state file is written through a temporary file and rename so an interrupted write does not leave a partial JSON file.
+
+`comquad regenerate --force` rebuilds project state from managed Podman labels and Quadlet files. Because it cannot reconstruct the previous generated baseline, the next `up` uses the two-way comparison described above.
+
+## Generated Resources
+
+Depending on the Compose file, comquad can generate:
+
+| Compose resource | Quadlet resource |
+|---|---|
+| Service | `.container` |
+| Image reference | `.image` |
+| Build block | `.build` |
+| Network | `.network` |
+| Named volume | `.volume` |
+| Secret | Native secret directives or secret mounts |
+
+Container units reference their companion image or build units. This lets Quadlet and systemd express dependencies between pulling or building an image and starting its container.
+
+External networks and volumes are not generated or removed by comquad. They remain references to the externally managed Podman resources.
+
+Generated files are placed in the systemd Quadlet directory for the current execution context:
+
+- Rootless: `~/.config/containers/systemd`
+- Root: `/etc/containers/systemd`
+
+## Runtime Commands
+
+Commands such as `start`, `stop`, and `restart` operate on already-generated units through systemd D-Bus. They do not regenerate files or run reconciliation.
+
+Commands that inspect or interact with services use the project state to resolve Compose service names to Quadlet files:
+
+- `ps` combines Podman container information with systemd unit state.
+- `logs` reads journald output and combines logs from multiple units chronologically.
+- `exec` runs `podman exec` against the resolved container.
+- `view` reads generated units and can show a project resource overview.
+- `edit` opens generated units in `$EDITOR`, then reloads systemd when files change.
+
+`down` stops the project's units, removes generated files and managed networks, unregisters the project, and removes auxiliary state. Named volumes are retained unless `--delete-volumes` is supplied.
+
+## Failure Boundaries
+
+comquad treats generated files, state, and systemd operations as separate steps:
+
+- Transpilation errors stop before deployment.
+- Dry runs do not perform writes or runtime changes.
+- Reconciliation plans are computed before files are modified.
+- File and baseline writes are atomic and have rollback handling.
+- A failed service operation is reported rather than hidden by the CLI.
+
+The systemd manager remains the source of truth for whether a unit is running. Podman remains the source of truth for container and resource details.
+
+## Further Reading
+
+- [README.md](./README.md) for installation and command usage
+- [DEVELOPMENT.md](./DEVELOPMENT.md) for package details, command internals, and testing
+- [compose2quadlet/ARCHITECTURE.md](./compose2quadlet/ARCHITECTURE.md) for the conversion library
+- [compose2quadlet/doc/mapping.md](./compose2quadlet/doc/mapping.md) for Compose field mappings

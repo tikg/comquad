@@ -43,6 +43,10 @@ func (o *Orchestrator) Down(removeVolumes bool, dryRun bool) error {
 		logger.Warn("Some units failed to stop: " + err.Error())
 	}
 
+	if err := o.verifyUnitsStopped(dbusMgr, state.Files); err != nil {
+		return fmt.Errorf("failed to stop all container units: %w", err)
+	}
+
 	for _, f := range state.Files {
 		if strings.HasSuffix(f, ".network") {
 			unitName := NetworkFileToUnitName(f)
@@ -105,6 +109,18 @@ func (o *Orchestrator) Down(removeVolumes bool, dryRun bool) error {
 
 	if err := stateMgr.UnregisterProject(o.projectName); err != nil {
 		return fmt.Errorf("failed to unregister project: %w", err)
+	}
+
+	if secretsDir, err := resolveSecretsDir(o.projectName); err == nil {
+		os.RemoveAll(secretsDir)
+	}
+
+	if buildCacheDir, err := resolveBuildCacheDir(o.projectName); err == nil {
+		os.RemoveAll(buildCacheDir)
+	}
+
+	if baselineDir, err := resolveBaselineDir(o.projectName); err == nil {
+		os.RemoveAll(baselineDir)
 	}
 
 	logger.Success("Successfully removed project: " + o.projectName)

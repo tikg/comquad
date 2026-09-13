@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-systemd/v22/dbus"
+	"github.com/jedib0t/go-pretty/v6/table"
 
 	"github.com/Inoriol/comquad/internal/logger"
 )
@@ -35,7 +36,7 @@ func (o *Orchestrator) Ps(all bool) error {
 
 	var unitNames []string
 	for _, c := range containers {
-		unitNames = append(unitNames, c.Name+".service")
+		unitNames = append(unitNames, "cq-"+c.Name+".service")
 	}
 
 	if len(unitNames) > 0 {
@@ -50,7 +51,7 @@ func (o *Orchestrator) Ps(all bool) error {
 		}
 
 		for i := range containers {
-			unitName := containers[i].Name + ".service"
+			unitName := "cq-" + containers[i].Name + ".service"
 			if u, ok := unitStateMap[unitName]; ok {
 				containers[i].DBusActive = u.ActiveState
 				containers[i].DBusSub = u.SubState
@@ -58,8 +59,6 @@ func (o *Orchestrator) Ps(all bool) error {
 		}
 	}
 
-	// Print table
-	// Sort: running first by name, then other states by name
 	sort.SliceStable(containers, func(i, j int) bool {
 		if containers[i].State == "running" && containers[j].State != "running" {
 			return true
@@ -82,46 +81,14 @@ func (o *Orchestrator) Ps(all bool) error {
 }
 
 func printPsTable(containers []ContainerInfo) {
-	nameW := max(len("NAME"), 20)
-	imageW := max(len("IMAGE"), 30)
-	commandW := max(len("COMMAND"), 25)
-	serviceW := max(len("SERVICE"), 12)
-	createdW := max(len("CREATED"), 20)
-	statusW := max(len("STATUS"), 20)
-	portsW := max(len("PORTS"), 30)
+	tw := table.NewWriter()
+	tw.SetStyle(table.StyleLight)
+	tw.SetColumnConfigs([]table.ColumnConfig{
+		{Number: 3, WidthMax: 30},
+	})
+	tw.AppendHeader(table.Row{"NAME", "IMAGE", "COMMAND", "SERVICE", "CREATED", "STATUS", "PORTS"})
 
-	for _, c := range containers {
-		if len(c.Name) > nameW {
-			nameW = len(c.Name)
-		}
-		if len(c.Image) > imageW {
-			imageW = len(c.Image)
-		}
-		if len(c.Command) > commandW {
-			commandW = len(c.Command)
-		}
-		if len(c.Service) > serviceW {
-			serviceW = len(c.Service)
-		}
-		if len(c.Status) > statusW {
-			statusW = len(c.Status)
-		}
-		portStr := formatPorts(c.Ports, c.ExposedPorts)
-		if len(portStr) > portsW {
-			portsW = len(portStr)
-		}
-	}
-
-	header := fmt.Sprintf("%-*s %-*s %-*s %-*s %-*s %-*s %-*s",
-		nameW, "NAME",
-		imageW, "IMAGE",
-		commandW, "COMMAND",
-		serviceW, "SERVICE",
-		createdW, "CREATED",
-		statusW, "STATUS",
-		portsW, "PORTS")
-	logger.Print(header)
-	logger.Print(strings.Repeat("-", len(header)))
+	cmdMaxLen := 30 * 2 // 2 lines at WidthMax
 
 	for _, c := range containers {
 		status := c.Status
@@ -134,16 +101,23 @@ func printPsTable(containers []ContainerInfo) {
 		created := formatCreated(c.CreatedAt, c.ExitedAt, c.State)
 		portStr := formatPorts(c.Ports, c.ExposedPorts)
 
-		row := fmt.Sprintf("%-*s %-*s %-*s %-*s %-*s %-*s %-*s",
-			nameW, truncate(c.Name, nameW),
-			imageW, truncate(c.Image, imageW),
-			commandW, truncate(c.Command, commandW),
-			serviceW, truncate(c.Service, serviceW),
-			createdW, created,
-			statusW, truncate(status, statusW),
-			portsW, truncate(portStr, portsW))
-		logger.Print(row)
+		command := c.Command
+		if len(command) > cmdMaxLen {
+			command = command[:cmdMaxLen-3] + "..."
+		}
+
+		tw.AppendRow(table.Row{
+			c.Name,
+			c.Image,
+			command,
+			c.Service,
+			created,
+			status,
+			portStr,
+		})
 	}
+
+	logger.Print(tw.Render())
 }
 
 func formatPorts(ports []PortInfo, exposedPorts []string) string {
@@ -202,14 +176,4 @@ func formatTimeAgo(t time.Time) string {
 		return fmt.Sprintf("%dd ago", days)
 	}
 	return t.Format("Jan 02 2006")
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	if maxLen <= 3 {
-		return s[:maxLen]
-	}
-	return s[:maxLen-3] + "..."
 }

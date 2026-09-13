@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -19,7 +18,12 @@ import (
 var checkCmd = &cobra.Command{
 	Use:   "check",
 	Short: "Check that required tools and services are available",
+<<<<<<< HEAD
 	RunE: func(cmd *cobra.Command, args []string) error {	
+=======
+	RunE: func(cmd *cobra.Command, args []string) error {
+		tools := []string{"podman"}
+>>>>>>> upstream/main
 		var missing []string
 		var warnings []string
 
@@ -39,19 +43,11 @@ var checkCmd = &cobra.Command{
 			logger.Printf("  %s: %s\n", tool, path)
 		}
 
-		if out, err := exec.Command("podman", "version", "--format", "{{.Version}}").Output(); err == nil {
-			raw := strings.TrimSpace(string(out))
-			raw = strings.TrimPrefix(raw, "v")
-			logger.Printf("  Podman version: %s\n", raw)
-			parts := strings.SplitN(raw, ".", 3)
-			if len(parts) >= 2 {
-				major, _ := strconv.Atoi(parts[0])
-				minor, _ := strconv.Atoi(parts[1])
-				if major < 4 || (major == 4 && minor < 4) {
-					warnings = append(warnings, fmt.Sprintf(
-						"Podman %d.%d detected — quadlet support requires 4.4+", major, minor))
-				}
-			}
+		if err := deploy.ValidatePodmanVersion(); err != nil {
+			warnings = append(warnings, err.Error())
+		} else {
+			out, _ := exec.Command("podman", "version", "--format", "{{.Version}}").Output()
+			logger.Printf("  Podman version: %s\n", strings.TrimSpace(string(out)))
 		}
 
 		if _, err := exec.LookPath("systemctl"); err != nil {

@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	unitStartTimeout     = 30 * time.Second
-	unitStopTimeout      = 30 * time.Second
-	unitRestartTimeout   = 30 * time.Second
-	waitForUnitTimeout   = 15 * time.Second
-	waitForUnitPoll      = 500 * time.Millisecond
+	unitStartTimeout   = 5 * time.Minute
+	unitStopTimeout    = 30 * time.Second
+	unitRestartTimeout = 30 * time.Second
+	waitForUnitTimeout = 15 * time.Second
+	waitForUnitPoll    = 500 * time.Millisecond
 )
 
 // SystemdManager handles direct communication with the systemd D-Bus
@@ -216,10 +216,12 @@ func removePodmanResources(resourceType, projectName string) error {
 	switch resourceType {
 	case "network":
 		cmd = exec.Command("podman", "network", "ls",
+			"--filter", "label=com.comquad.managed=true",
 			"--filter", "label=com.comquad.project="+projectName,
 			"--format", "{{.Name}}")
 	case "volume":
 		cmd = exec.Command("podman", "volume", "ls",
+			"--filter", "label=com.comquad.managed=true",
 			"--filter", "label=com.comquad.project="+projectName,
 			"--format", "{{.Name}}")
 	default:
@@ -359,12 +361,20 @@ func RegenerateState() (*StateManager, error) {
 			continue
 		}
 
-		prefix := "cq-" + projectName
+		prefix := "cq-" + projectName + "-"
 		for _, f := range entries {
 			if strings.HasPrefix(f.Name(), prefix) && (strings.HasSuffix(f.Name(), ".container") ||
 				strings.HasSuffix(f.Name(), ".network") || strings.HasSuffix(f.Name(), ".volume") ||
 				strings.HasSuffix(f.Name(), ".image") || strings.HasSuffix(f.Name(), ".build")) {
 				files = append(files, filepath.Join(targetDir, f.Name()))
+
+				name := strings.TrimSuffix(strings.TrimPrefix(f.Name(), prefix), filepath.Ext(f.Name()))
+				switch {
+				case strings.HasSuffix(f.Name(), ".image"):
+					resources.Images = append(resources.Images, name)
+				case strings.HasSuffix(f.Name(), ".build"):
+					resources.Builds = append(resources.Builds, name)
+				}
 			}
 		}
 
